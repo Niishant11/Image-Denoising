@@ -1,0 +1,25 @@
+
+---
+
+## 📄 requirements.txt
+
+```txt
+# Core
+torch
+torchvision
+torchaudio
+
+# Array & image
+numpy
+opencv-python
+Pillow
+scikit-image
+
+# Utils & training
+tqdm
+pyyaml
+matplotlib
+tensorboard
+
+# Optional but useful for Transformer rearrangements
+einops

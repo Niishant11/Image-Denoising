@@ -1,0 +1,59 @@
+# =========================
+# Hybrid CNN–Transformer Denoising Config
+# =========================
+
+dataset:
+  name: BSD500
+  root: data
+  raw_dir: data/raw
+  noisy_dir: data/noisy
+  processed_dir: data/processed
+  patch_size: 128        # ✅ used now
+  train_split: train
+  val_split: val
+  test_split: test
+  augment: true
+
+noise:
+  gaussian:
+    enabled: true
+    sigma_values: [15, 25, 50]
+  non_gaussian:
+    enabled: true           # e.g., speckle, impulse
+  mode: "both"              # "gaussian", "non_gaussian", or "both"
+
+model:
+  type: "hybrid"            # hybrid / cnn / transformer
+  base_channels: 64
+  num_cnn_blocks: 10
+  num_transformer_blocks: 4
+  use_residual_learning: true
+
+training:
+  batch_size: 4
+  num_workers: 4
+  epochs: 50
+  lr: 0.001
+  optimizer: "adam"
+  weight_decay: 0.0
+  lr_step: 20
+  lr_gamma: 0.1
+  save_checkpoint_dir: "experiments/checkpoints"
+  log_dir: "experiments/logs"
+  resume: false
+  resume_path: ""
+
+evaluation:
+  metrics: ["psnr", "ssim"]
+  save_images: true
+  results_dir: "results/images"
+  tables_dir: "results/tables"
+
+inference:
+  tile_size: 256        # for large images, optional tiling
+  overlap: 16
+
+device:
+  use_gpu: true
+  gpu_id: 0
+  seed: 42

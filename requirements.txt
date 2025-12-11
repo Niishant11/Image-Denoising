@@ -1,0 +1,21 @@
+# Core Deep Learning
+torch
+torchvision
+torchaudio
+
+# Numerical Processing
+numpy
+
+# Image Processing
+opencv-python
+Pillow
+scikit-image
+
+# Utilities
+tqdm
+matplotlib
+pyyaml
+tensorboard
+
+# Transformer utilities
+einops
