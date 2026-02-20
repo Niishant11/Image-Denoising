@@ -252,6 +252,107 @@ class TransformerFeatureExtractor(nn.Module):
         return x
 
 
+class MDTA(nn.Module):
+    """
+    Multi-Dconv Transpose Attention (MDTA) inspired block.
+    Simplified to channel-wise attention over spatial tokens.
+    """
+
+    def __init__(self, dim: int, num_heads: int = 4, bias: bool = True):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
+        self.dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, padding=1, groups=dim * 3, bias=bias)
+        self.proj = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        qkv = self.dwconv(self.qkv(x))
+        q, k, v = torch.chunk(qkv, chunks=3, dim=1)
+
+        q = q.view(b, self.num_heads, self.head_dim, h * w)
+        k = k.view(b, self.num_heads, self.head_dim, h * w)
+        v = v.view(b, self.num_heads, self.head_dim, h * w)
+
+        q = q / (h * w) ** 0.5
+        attn = torch.matmul(q, k.transpose(-2, -1))
+        attn = attn.softmax(dim=-1)
+
+        out = torch.matmul(attn, v)
+        out = out.view(b, c, h, w)
+        out = self.proj(out)
+        return out
+
+
+class GDFN(nn.Module):
+    """
+    Gated-Dconv Feed-Forward Network (GDFN) inspired block.
+    """
+
+    def __init__(self, dim: int, expansion_factor: float = 2.0, bias: bool = True):
+        super().__init__()
+        hidden_dim = int(dim * expansion_factor)
+        self.project_in = nn.Conv2d(dim, hidden_dim * 2, kernel_size=1, bias=bias)
+        self.dwconv = nn.Conv2d(hidden_dim * 2, hidden_dim * 2, kernel_size=3, padding=1, groups=hidden_dim * 2, bias=bias)
+        self.project_out = nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.project_in(x)
+        x = self.dwconv(x)
+        x1, x2 = torch.chunk(x, chunks=2, dim=1)
+        x = torch.nn.functional.gelu(x1) * x2
+        x = self.project_out(x)
+        return x
+
+
+class RestormerBlock(nn.Module):
+    """
+    Restormer-style block with MDTA + GDFN.
+    """
+
+    def __init__(self, dim: int, num_heads: int = 4, expansion_factor: float = 2.0, bias: bool = True):
+        super().__init__()
+        self.norm1 = LayerNorm2d(dim)
+        self.attn = MDTA(dim=dim, num_heads=num_heads, bias=bias)
+        self.norm2 = LayerNorm2d(dim)
+        self.ffn = GDFN(dim=dim, expansion_factor=expansion_factor, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class RestormerFeatureExtractor(nn.Module):
+    """
+    Lightweight Restormer-style feature extractor.
+    """
+
+    def __init__(self, in_channels: int = 64, num_blocks: int = 4, num_heads: int = 4, expansion_factor: float = 2.0):
+        super().__init__()
+        self.entry = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=True)
+        self.blocks = nn.Sequential(
+            *[
+                RestormerBlock(
+                    dim=in_channels,
+                    num_heads=num_heads,
+                    expansion_factor=expansion_factor,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        self.exit = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.entry(x)
+        x = self.blocks(x)
+        x = self.exit(x)
+        return x
+
+
 if __name__ == "__main__":
     # Quick test
     x = torch.randn(1, 64, 128, 128)  # H and W must be divisible by window_size=8

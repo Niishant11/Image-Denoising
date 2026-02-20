@@ -156,8 +156,10 @@ def main():
     model_cfg = cfg.get("model", {})
     in_channels = 3
     base_channels = model_cfg.get("base_channels", 64)
-    num_cnn_blocks = model_cfg.get("num_cnn_blocks", 5)
-    num_transformer_blocks = model_cfg.get("num_transformer_blocks", 4)
+    num_cnn_blocks = model_cfg.get("num_cnn_blocks", 17)
+    num_transformer_blocks = model_cfg.get("num_transformer_blocks", [2, 2, 4, 4])
+    num_heads = model_cfg.get("num_heads", [1, 2, 4, 8])
+    expansion_factor = model_cfg.get("expansion_factor", 2.0)
     fusion_type = model_cfg.get("fusion_type", "concat")
     residual_learning = model_cfg.get("use_residual_learning", True)
 
@@ -166,6 +168,8 @@ def main():
         base_channels=base_channels,
         num_cnn_blocks=num_cnn_blocks,
         num_transformer_blocks=num_transformer_blocks,
+        num_heads=num_heads,
+        expansion_factor=expansion_factor,
         fusion_type=fusion_type,
         residual_learning=residual_learning,
     ).to(device)
