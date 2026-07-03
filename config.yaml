@@ -7,8 +7,7 @@ dataset:
   root: data
   raw_dir: data/raw
   noisy_dir: data/noisy
-  processed_dir: data/processed
-  patch_size: 128        # ✅ used now
+  patch_size: 128        # smaller patches for faster training
   train_split: train
   val_split: val
   test_split: test
@@ -20,24 +19,29 @@ noise:
     sigma_values: [15, 25, 50]
   non_gaussian:
     enabled: true           # e.g., speckle, impulse
-  mode: "both"              # "gaussian", "non_gaussian", or "both"
+  mode: "gaussian"          # "gaussian", "non_gaussian", or "both"
 
 model:
   type: "hybrid"            # hybrid / cnn / transformer
-  base_channels: 64
-  num_cnn_blocks: 10
-  num_transformer_blocks: 4
+  base_channels: 48
+  num_cnn_blocks: 17         # DnCNN depth
+  num_transformer_blocks: [2, 2, 4, 4]  # Restormer depth per stage
+  num_heads: [1, 2, 4, 8]
+  expansion_factor: 2.0
+  fusion_type: "gate"
   use_residual_learning: true
 
 training:
-  batch_size: 4
+  batch_size: 2
   num_workers: 4
-  epochs: 50
-  lr: 0.001
-  optimizer: "adam"
-  weight_decay: 0.0
-  lr_step: 20
-  lr_gamma: 0.1
+  epochs: 100
+  lr: 0.0003
+  optimizer: "adamw"
+  weight_decay: 0.01
+  scheduler: "cosine"        # "step" or "cosine"
+  lr_step: 30
+  lr_gamma: 0.5
+  loss_type: "charbonnier_ssim"
   save_checkpoint_dir: "experiments/checkpoints"
   log_dir: "experiments/logs"
   resume: false
@@ -52,6 +56,7 @@ evaluation:
 inference:
   tile_size: 256        # for large images, optional tiling
   overlap: 16
+  denoise_strength: 1.3  # >1.0 makes denoising more visible
 
 device:
   use_gpu: true

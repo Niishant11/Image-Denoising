@@ -177,14 +177,15 @@ def main():
     print(model)
     print(f"Total parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    # Loss
-    criterion = DenoisingLoss(loss_type="mse").to(device)
-
     # Optimizer & scheduler
     train_cfg = cfg["training"]
     lr = train_cfg.get("lr", 1e-3)
     weight_decay = train_cfg.get("weight_decay", 0.0)
     optimizer_name = train_cfg.get("optimizer", "adam").lower()
+
+    # Loss
+    loss_type = train_cfg.get("loss_type", "mse")
+    criterion = DenoisingLoss(loss_type=loss_type).to(device)
 
     if optimizer_name == "adam":
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -195,7 +196,15 @@ def main():
 
     lr_step = train_cfg.get("lr_step", 20)
     lr_gamma = train_cfg.get("lr_gamma", 0.1)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step, gamma=lr_gamma)
+    scheduler_type = train_cfg.get("scheduler", "step").lower()
+
+    if scheduler_type == "cosine":
+        num_epochs_cfg = train_cfg.get("epochs", 100)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_epochs_cfg, eta_min=1e-6
+        )
+    else:
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step, gamma=lr_gamma)
 
     # Dataloaders
     batch_size = train_cfg.get("batch_size", 16)
@@ -206,21 +215,25 @@ def main():
     train_loader = get_bsd500_dataloader(
         root_dir=".",
         split="train",
-        noise_type="gaussian",  # change if needed
+        noise_type="gaussian",
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         patch_size=patch_size,
+        on_the_fly=True,       # generate noise dynamically for training diversity
+        sigma_range=(5.0, 50.0),
+        augment=True,          # random flips + rotations
     )
 
     val_loader = get_bsd500_dataloader(
         root_dir=".",
         split="val",
-        noise_type="gaussian",  # should match training noise or test variant
+        noise_type="gaussian",
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         patch_size=patch_size,
+        on_the_fly=False,       # use fixed noisy images for consistent validation
     )
 
 

@@ -3,7 +3,7 @@ import shutil
 import sys
 import threading
 from datetime import datetime
-from pathlib import Path
+from typing import Dict, List, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -26,6 +26,7 @@ except Exception:
 	ssim_batch = None
 	METRICS_AVAILABLE = False
 from models.hybrid_model import HybridDenoiser
+from scripts.moderate_denoise import moderate_denoise
 
 
 class DenoiseApp:
@@ -38,14 +39,19 @@ class DenoiseApp:
 		self.preview_w = 420
 		self.preview_h = 280
 
-		self.input_image_path = None
-		self.clean_image_path = None
-		self.output_image_path = None
-		self.base_output_image_path = None
-		self.comparison_image_path = None
+		self.input_image_path: Optional[str] = None
+		self.output_image_path: Optional[str] = None
+		self.base_output_image_path: Optional[str] = None
+		self.comparison_image_path: Optional[str] = None
+		self.heatmap_image_path: Optional[str] = None
 
 		self.input_photo = None
 		self.output_photo = None
+		self._image_refs: Dict[tk.Label, ImageTk.PhotoImage] = {}
+		self.prompt_text = None
+		self.prompt_status_label = None
+		self.prompt_settings = None
+		self.use_prompt_var = tk.BooleanVar(value=True)
 
 		self.model = None
 		self.device = None
@@ -99,16 +105,24 @@ class DenoiseApp:
 
 		input_wrap, self.input_frame = self._make_card(top_row, "Input (Noisy)")
 		input_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
-		input_wrap.configure(width=520, height=320)
+		input_wrap.configure(width=360, height=320)
 		input_wrap.pack_propagate(False)
+
+		heatmap_wrap, self.heatmap_frame = self._make_card(top_row, "Heatmap")
+		heatmap_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 8))
+		heatmap_wrap.configure(width=360, height=320)
+		heatmap_wrap.pack_propagate(False)
 
 		output_wrap, self.output_frame = self._make_card(top_row, "Output (Denoised)")
 		output_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
-		output_wrap.configure(width=520, height=320)
+		output_wrap.configure(width=360, height=320)
 		output_wrap.pack_propagate(False)
 
 		self.input_image_label = tk.Label(self.input_frame, bg=self.colors["panel"], width=60, height=18)
 		self.input_image_label.pack(fill=tk.BOTH, expand=True)
+
+		self.heatmap_image_label = tk.Label(self.heatmap_frame, bg=self.colors["panel"], width=60, height=18)
+		self.heatmap_image_label.pack(fill=tk.BOTH, expand=True)
 
 		self.output_image_label = tk.Label(self.output_frame, bg=self.colors["panel"], width=60, height=18)
 		self.output_image_label.pack(fill=tk.BOTH, expand=True)
@@ -119,9 +133,6 @@ class DenoiseApp:
 		self.upload_btn = ttk.Button(button_row, text="Upload Noisy Image", command=self.on_upload)
 		self.upload_btn.pack(side=tk.LEFT)
 
-		self.upload_clean_btn = ttk.Button(button_row, text="Upload Clean (Optional)", command=self.on_upload_clean)
-		self.upload_clean_btn.pack(side=tk.LEFT, padx=10)
-
 		self.denoise_btn = ttk.Button(button_row, text="Start Denoise", command=self.on_denoise)
 		self.denoise_btn.pack(side=tk.LEFT, padx=10)
 
@@ -129,9 +140,37 @@ class DenoiseApp:
 		self.save_btn.pack(side=tk.LEFT)
 		self.save_btn.configure(state=tk.DISABLED)
 
-		self.hd_var = tk.BooleanVar(value=False)
-		self.hd_check = ttk.Checkbutton(button_row, text="HD x4 (Real-ESRGAN)", variable=self.hd_var)
-		self.hd_check.pack(side=tk.LEFT, padx=10)
+		prompt_row = ttk.Frame(container)
+		prompt_row.pack(fill=tk.X, pady=(0, 12))
+
+		prompt_wrap, prompt_frame = self._make_card(prompt_row, "Prompt Tuning")
+		prompt_wrap.pack(fill=tk.BOTH, expand=True)
+		prompt_wrap.configure(height=120)
+		prompt_wrap.pack_propagate(False)
+
+		prompt_toolbar = ttk.Frame(prompt_frame)
+		prompt_toolbar.pack(fill=tk.X, pady=(0, 6))
+
+		prompt_toggle = ttk.Checkbutton(
+			prompt_toolbar,
+			text="Use prompt-based tuning",
+			variable=self.use_prompt_var,
+		)
+		prompt_toggle.pack(side=tk.LEFT)
+
+		self.prompt_status_label = ttk.Label(prompt_toolbar, text="", style="Sub.TLabel")
+		self.prompt_status_label.pack(side=tk.RIGHT)
+
+		self.prompt_text = tk.Text(prompt_frame, height=4, wrap=tk.WORD, bg=self.colors["card"], fg=self.colors["text"], relief="flat")
+		self.prompt_text.pack(fill=tk.BOTH, expand=True)
+
+		default_prompt = (
+			"Remove extreme multicolor digital noise and heavy grain from this image while preserving all original details and textures. "
+			"Maintain the natural colors, lighting, and depth of the scene. Apply intelligent noise reduction (40–60%) without oversmoothing. "
+			"Keep edges sharp and well-defined. Preserve fine structural details and surface textures. Improve clarity and contrast slightly while keeping the image realistic and photo-accurate. "
+			"Avoid artificial smoothing, plastic look, or fake detail generation. Ensure the final result looks natural and professionally restored."
+		)
+		self.prompt_text.insert("1.0", default_prompt)
 
 		bottom_row = ttk.Frame(container)
 		bottom_row.pack(fill=tk.BOTH, expand=True)
@@ -227,18 +266,6 @@ class DenoiseApp:
 		self._show_image(path, self.input_image_label, is_input=True)
 		self._log(f"Loaded input image: {os.path.basename(path)}")
 
-	def on_upload_clean(self) -> None:
-		filetypes = [
-			("Image files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
-			("All files", "*.*"),
-		]
-		path = filedialog.askopenfilename(title="Select clean image (optional)", filetypes=filetypes)
-		if not path:
-			return
-
-		self.clean_image_path = path
-		self._log(f"Loaded clean target: {os.path.basename(path)}")
-
 	def on_denoise(self) -> None:
 		if not self.input_image_path:
 			messagebox.showwarning("Missing image", "Please upload a noisy image first.")
@@ -250,6 +277,7 @@ class DenoiseApp:
 
 		self.denoise_btn.configure(state=tk.DISABLED)
 		self.save_btn.configure(state=tk.DISABLED)
+		self.prompt_settings = self._get_prompt_settings()
 		self._log("Starting denoise...")
 
 		worker = threading.Thread(target=self._run_denoise, daemon=True)
@@ -260,10 +288,6 @@ class DenoiseApp:
 			image_tensor = load_image(self.input_image_path, resize=None)
 			image_tensor_device = image_tensor.to(self.device)
 
-			clean_tensor = None
-			if self.clean_image_path:
-				clean_tensor = load_image(self.clean_image_path, resize=None)
-
 			output = self._infer_tiled(image_tensor_device)
 			output_cpu = output.detach().cpu()
 
@@ -273,15 +297,24 @@ class DenoiseApp:
 			self.output_image_path = os.path.join(results_dir, f"denoised_{timestamp}.png")
 			self.base_output_image_path = self.output_image_path
 			self.comparison_image_path = os.path.join(results_dir, f"comparison_{timestamp}.png")
+			self.heatmap_image_path = os.path.join(results_dir, f"heatmap_{timestamp}.png")
 
 			save_output(output_cpu, self.output_image_path)
 
-			if self.hd_var.get():
-				hd_path = os.path.join(results_dir, f"denoised_hd_{timestamp}.png")
-				hd_ok = self._apply_super_resolution(self.output_image_path, hd_path)
-				if hd_ok:
-					self.output_image_path = hd_path
-					self._log(f"HD output saved: {os.path.basename(hd_path)}")
+			improve_path = os.path.join(results_dir, f"denoised_improved_{timestamp}.png")
+			improved = moderate_denoise(
+				self.output_image_path,
+				improve_path,
+				strength=self._get_prompt_value("post_strength", 0.45),
+				clarity=self._get_prompt_value("clarity", 0.12),
+				contrast=self._get_prompt_value("contrast", 0.1),
+				sharpen=self._get_prompt_value("sharpen", 0.18),
+			)
+			if improved:
+				self.output_image_path = improve_path
+				self._log(f"Improved output saved: {os.path.basename(improve_path)}")
+			else:
+				self._log("Postprocess skipped (OpenCV/PIL not available or failed).")
 
 			self._save_comparison_image(self.comparison_image_path)
 
@@ -292,29 +325,28 @@ class DenoiseApp:
 
 			psnr_val = None
 			ssim_val = None
-			metric_ref = "input"
-			metric_target = image_tensor
-			if clean_tensor is not None:
-				metric_ref = "clean"
-				metric_target = clean_tensor
-			if METRICS_AVAILABLE:
+			if METRICS_AVAILABLE and psnr is not None and ssim_batch is not None:
 				try:
-					psnr_val = psnr(output_cpu, metric_target)
-					ssim_val = ssim_batch(output_cpu, metric_target)
+					psnr_val = psnr(output_cpu, image_tensor)
+					ssim_val = ssim_batch(output_cpu, image_tensor)
 				except Exception as exc:
 					self._log(f"Metric computation skipped: {exc}")
 			else:
 				self._log("Metric computation skipped: skimage not available.")
 
-			self.root.after(0, self._update_ui_after_denoise, noise_pct, strength_pct, psnr_val, ssim_val, metric_ref)
+			self.root.after(0, self._update_ui_after_denoise, noise_pct, strength_pct, psnr_val, ssim_val)
 		except Exception as exc:
 			self.root.after(0, self._handle_denoise_error, exc)
 
-	def _update_ui_after_denoise(self, noise_pct: float, strength_pct: float, psnr_val, ssim_val, metric_ref: str) -> None:
-		self._show_image(self.output_image_path, self.output_image_label, is_input=False)
+	def _update_ui_after_denoise(self, noise_pct: float, strength_pct: float, psnr_val, ssim_val) -> None:
+		if self.output_image_path:
+			self._show_image(self.output_image_path, self.output_image_label, is_input=False)
+		if self.heatmap_image_path and os.path.exists(self.heatmap_image_path):
+			self._show_image(self.heatmap_image_path, self.heatmap_image_label, is_input=False)
 
 		model_cfg = self.cfg.get("model", {}) if self.cfg else {}
-		self._log(f"Output saved: {os.path.basename(self.output_image_path)}")
+		if self.output_image_path:
+			self._log(f"Output saved: {os.path.basename(self.output_image_path)}")
 		self._log(f"Params: base={model_cfg.get('base_channels', 64)}, cnn={model_cfg.get('num_cnn_blocks', 5)}, "
 				  f"transformer={model_cfg.get('num_transformer_blocks', 4)}, residual={model_cfg.get('use_residual_learning', True)}")
 
@@ -324,11 +356,13 @@ class DenoiseApp:
 			f"- Estimated denoise strength: {strength_pct:.2f}%",
 		]
 		if psnr_val is not None:
-			metrics_lines.append(f"- PSNR ({metric_ref} vs output): {psnr_val:.2f} dB")
+			metrics_lines.append(f"- PSNR (input vs output): {psnr_val:.2f} dB")
 		if ssim_val is not None:
-			metrics_lines.append(f"- SSIM ({metric_ref} vs output): {ssim_val:.4f}")
-		metrics_lines.append(f"- Output file: {os.path.basename(self.output_image_path)}")
-		metrics_lines.append(f"- Comparison file: {os.path.basename(self.comparison_image_path)}")
+			metrics_lines.append(f"- SSIM (input vs output): {ssim_val:.4f}")
+		if self.output_image_path:
+			metrics_lines.append(f"- Output file: {os.path.basename(self.output_image_path)}")
+		if self.comparison_image_path:
+			metrics_lines.append(f"- Comparison file: {os.path.basename(self.comparison_image_path)}")
 		metrics_text = "\n".join(metrics_lines)
 		self._set_metrics_text(metrics_text)
 
@@ -342,12 +376,14 @@ class DenoiseApp:
 
 	def _show_image(self, path: str, label: tk.Label, is_input: bool) -> None:
 		try:
+			if not path:
+				return
 			img = Image.open(path).convert("RGB")
 			img = ImageOps.contain(img, (self.preview_w, self.preview_h))
 			photo = ImageTk.PhotoImage(img)
 
 			label.configure(image=photo)
-			label.image = photo
+			self._image_refs[label] = photo
 
 			if is_input:
 				self.input_photo = photo
@@ -371,17 +407,22 @@ class DenoiseApp:
 
 	def _save_comparison_image(self, out_path: str) -> None:
 		try:
+			if not self.input_image_path or not self.base_output_image_path:
+				return
 			img_noisy = Image.open(self.input_image_path).convert("RGB")
 			img_output = Image.open(self.base_output_image_path).convert("RGB")
 
 			diff = ImageChops.difference(img_noisy, img_output).convert("L")
-			boost = diff.point(lambda p: min(255, p * 10))
+			def _boost_pixel(p: int) -> int:
+				return min(255, int(p * 10))
+
+			boost = diff.point(_boost_pixel)
 			boost = ImageOps.autocontrast(boost)
 			heatmap = ImageOps.colorize(boost, black="#2b2f6b", white="#ffcf4a")
 
-			images = [img_noisy, img_output, heatmap]
+			images: List[Image.Image] = [img_noisy, img_output, heatmap]
 			min_h = min(img.height for img in images)
-			resized = [ImageOps.contain(img, (img.width, min_h)) for img in images]
+			resized: List[Image.Image] = [ImageOps.contain(img, (img.width, min_h)) for img in images]
 
 			gap = 20
 			total_w = sum(img.width for img in resized) + gap * (len(resized) - 1)
@@ -393,71 +434,29 @@ class DenoiseApp:
 				x += img.width + gap
 
 			canvas.save(out_path)
+			if self.heatmap_image_path:
+				heatmap.save(self.heatmap_image_path)
 			self._log(f"Comparison saved: {os.path.basename(out_path)}")
 		except Exception as exc:
 			self._log(f"Comparison image skipped: {exc}")
-
-	def _apply_super_resolution(self, in_path: str, out_path: str) -> bool:
-		try:
-			from realesrgan import RealESRGANer
-			from basicsr.archs.rrdbnet_arch import RRDBNet
-			import cv2
-
-			weights_dir = Path(PROJECT_ROOT) / "results" / "weights"
-			weights_dir.mkdir(parents=True, exist_ok=True)
-			model_path = weights_dir / "RealESRGAN_x4plus.pth"
-
-			if not model_path.exists():
-				self._log("Downloading Real-ESRGAN weights...")
-				import urllib.request
-				url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-				urllib.request.urlretrieve(url, str(model_path))
-
-			model = RRDBNet(
-				num_in_ch=3,
-				num_out_ch=3,
-				num_feat=64,
-				num_block=23,
-				num_grow_ch=32,
-				scale=4,
-			)
-
-			use_half = self.device.type == "cuda"
-			upsampler = RealESRGANer(
-				scale=4,
-				model_path=str(model_path),
-				model=model,
-				tile=0,
-				tile_pad=10,
-				pre_pad=0,
-				half=use_half,
-				device=self.device,
-			)
-
-			img = cv2.imread(in_path, cv2.IMREAD_COLOR)
-			if img is None:
-				self._log("HD upscale skipped: failed to read image.")
-				return False
-
-			output, _ = upsampler.enhance(img, outscale=4)
-			cv2.imwrite(out_path, output)
-			return True
-		except Exception as exc:
-			self._log(f"HD upscale skipped: {exc}")
-			return False
 
 	def _infer_tiled(self, image_tensor: torch.Tensor) -> torch.Tensor:
 		inf_cfg = self.cfg.get("inference", {}) if self.cfg else {}
 		tile_size = int(inf_cfg.get("tile_size", 0) or 0)
 		overlap = int(inf_cfg.get("overlap", 0) or 0)
+		denoise_strength = float(inf_cfg.get("denoise_strength", 1.0) or 1.0)
+		if self.prompt_settings and "denoise_strength" in self.prompt_settings:
+			denoise_strength = float(self.prompt_settings["denoise_strength"])
 
 		_, _, h, w = image_tensor.shape
 		if tile_size <= 0 or tile_size >= max(h, w):
 			self._log(f"Tiling disabled. Using full image (H={h}, W={w}).")
-			return infer_image(self.model, image_tensor, self.device, window_size=8)
+			self._log(f"Denoise strength: {denoise_strength:.2f}")
+			return infer_image(self.model, image_tensor, self.device, window_size=8, denoise_strength=denoise_strength)
 
 		step = max(1, tile_size - overlap)
 		self._log(f"Tiling enabled. tile={tile_size}, overlap={overlap}, step={step}.")
+		self._log(f"Denoise strength: {denoise_strength:.2f}")
 
 		output = torch.zeros_like(image_tensor)
 		weight = torch.zeros_like(image_tensor)
@@ -470,12 +469,84 @@ class DenoiseApp:
 				x1 = min(x0 + tile_size, w)
 
 				tile = image_tensor[:, :, y0:y1, x0:x1]
-				out_tile = infer_image(self.model, tile, self.device, window_size=8)
+				out_tile = infer_image(self.model, tile, self.device, window_size=8, denoise_strength=denoise_strength)
 
 				output[:, :, y0:y1, x0:x1] += out_tile
 				weight[:, :, y0:y1, x0:x1] += 1.0
 
 		return output / weight.clamp_min(1.0)
+
+	def _get_prompt_value(self, key: str, default: float) -> float:
+		if not self.prompt_settings:
+			return default
+			
+		val = self.prompt_settings.get(key)
+		if val is None:
+			return default
+		return float(val)
+
+	def _get_prompt_settings(self) -> Optional[Dict[str, float]]:
+		if not self.use_prompt_var.get() or not self.prompt_text:
+			if self.prompt_status_label:
+				self.prompt_status_label.configure(text="Prompt tuning off")
+			return None
+
+		prompt = self.prompt_text.get("1.0", tk.END).strip()
+		if not prompt:
+			if self.prompt_status_label:
+				self.prompt_status_label.configure(text="Prompt empty")
+			return None
+
+		import re
+		strength_pct = 45.0
+		range_match = re.search(r"(\d+)\s*[-–]\s*(\d+)\s*%", prompt)
+		if range_match:
+			low = float(range_match.group(1))
+			high = float(range_match.group(2))
+			strength_pct = max(0.0, min(100.0, (low + high) / 2.0))
+		else:
+			single_match = re.search(r"(\d+)\s*%", prompt)
+			if single_match:
+				strength_pct = max(0.0, min(100.0, float(single_match.group(1))))
+
+		noise_strength = strength_pct / 100.0
+		denoise_strength = 1.0 + noise_strength * 0.8
+
+		if "heavy" in prompt.lower():
+			denoise_strength += 0.05
+		if "do not oversmooth" in prompt.lower() or "dont oversmooth" in prompt.lower():
+			denoise_strength = min(denoise_strength, 1.35)
+
+		clarity = 0.12
+		if "enhance clarity" in prompt.lower():
+			clarity = 0.15
+		if "slightly" in prompt.lower():
+			clarity = min(clarity, 0.15)
+
+		contrast = 0.1 if "contrast" in prompt.lower() else 0.05
+		sharpen = 0.18 if "sharp" in prompt.lower() or "edges" in prompt.lower() else 0.12
+
+		settings = {
+			"denoise_strength": max(1.0, min(1.8, denoise_strength)),
+			"post_strength": max(0.2, min(0.7, noise_strength)),
+			"clarity": max(0.05, min(0.25, clarity)),
+			"contrast": max(0.0, min(0.2, contrast)),
+			"sharpen": max(0.05, min(0.3, sharpen)),
+		}
+
+		if self.prompt_status_label:
+			self.prompt_status_label.configure(
+				text=f"Strength {settings['denoise_strength']:.2f} | NR {settings['post_strength']:.2f}"
+			)
+		self._log(
+			"Prompt tuning active: "
+			f"denoise_strength={settings['denoise_strength']:.2f}, "
+			f"post_strength={settings['post_strength']:.2f}, "
+			f"clarity={settings['clarity']:.2f}, "
+			f"contrast={settings['contrast']:.2f}, "
+			f"sharpen={settings['sharpen']:.2f}"
+		)
+		return settings
 
 	def on_save_as(self) -> None:
 		if not self.output_image_path or not os.path.exists(self.output_image_path):

@@ -57,7 +57,7 @@ class HybridDenoiser(nn.Module):
         num_cnn_blocks: int = 17,
         num_transformer_blocks=(2, 2, 4, 4),
         num_heads=(1, 2, 4, 8),
-        expansion_factor: float = 2.0,
+            expansion_factor: float = 2.0,  # Reverted for checkpoint compatibility
         fusion_type: str = "concat",  # "concat", "add", "avg", or "gate"
         residual_learning: bool = True,
     ):
@@ -67,23 +67,24 @@ class HybridDenoiser(nn.Module):
         self.base_channels = base_channels
         self.residual_learning = residual_learning
 
-        # DnCNN branch
+        # DnCNN branch — predicts noise (residual_learning=False),
+        # outer fusion handles the final subtraction
         self.dncnn = DnCNN(
             in_channels=in_channels,
             out_channels=in_channels,
             num_features=base_channels,
             num_layers=num_cnn_blocks,
-            residual_learning=True,
+            residual_learning=False,
         )
 
-        # Restormer branch
+        # Restormer branch — predicts noise (residual_learning=False)
         self.restormer = RestormerDenoiser(
             in_channels=in_channels,
             base_channels=base_channels,
             num_blocks=num_transformer_blocks,
             num_heads=num_heads,
             expansion_factor=expansion_factor,
-            residual_learning=True,
+            residual_learning=False,
         )
 
         self.fusion_type = fusion_type
@@ -91,15 +92,16 @@ class HybridDenoiser(nn.Module):
             self.fuse_conv = nn.Sequential(
                 nn.Conv2d(in_channels * 2, in_channels, kernel_size=1, bias=True),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=True),
             )
         elif fusion_type == "add":
             self.fuse_conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=True)
         elif fusion_type == "gate":
+            # Learnable gate: produces a single [0,1] weight via sigmoid.
+            # fusion = gate * dncnn + (1 - gate) * restormer  (sums to 1)
             self.gate_conv = nn.Sequential(
                 nn.Conv2d(in_channels * 2, in_channels, kernel_size=1, bias=True),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(in_channels, 2, kernel_size=1, bias=True),
+                nn.Conv2d(in_channels, 1, kernel_size=1, bias=True),
                 nn.Sigmoid(),
             )
             self.fuse_conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=True)
@@ -108,23 +110,7 @@ class HybridDenoiser(nn.Module):
         else:
             raise ValueError(f"Unsupported fusion_type: {fusion_type}")
 
-        # If desired, you can also keep an optional refinement DnCNN:
-        # self.refine_dncnn = DnCNN(
-        #     in_channels=in_channels,
-        #     out_channels=in_channels,
-        #     num_features=base_channels,
-        #     num_layers=10,
-        #     residual_learning=True,
-        # )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, C, H, W] noisy input image
-
-        Returns:
-            denoised image [B, C, H, W]
-        """
         dncnn_out = self.dncnn(x)
         rest_out = self.restormer(x)
 
@@ -133,10 +119,9 @@ class HybridDenoiser(nn.Module):
         elif self.fusion_type == "add":
             fused = self.fuse_conv(dncnn_out + rest_out)
         elif self.fusion_type == "gate":
-            gates = self.gate_conv(torch.cat([dncnn_out, rest_out], dim=1))
-            gate_dn = gates[:, 0:1, :, :].expand_as(dncnn_out)
-            gate_rt = gates[:, 1:2, :, :].expand_as(rest_out)
-            fused = self.fuse_conv(gate_dn * dncnn_out + gate_rt * rest_out)
+            gate = self.gate_conv(torch.cat([dncnn_out, rest_out], dim=1))
+            # gate: [B, 1, H, W] in [0,1]
+            fused = self.fuse_conv(gate * dncnn_out + (1.0 - gate) * rest_out)
         elif self.fusion_type == "avg":
             fused = (dncnn_out + rest_out) / 2.0
         else:

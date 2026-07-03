@@ -37,7 +37,7 @@ def save_output(tensor, out_path):
 
 
 @torch.no_grad()
-def infer_image(model, img_tensor, device, window_size: int = 8):
+def infer_image(model, img_tensor, device, window_size: int = 8, denoise_strength: float = 1.0):
     """
     Run inference with padding so H and W are divisible by window_size.
     Args:
@@ -64,6 +64,11 @@ def infer_image(model, img_tensor, device, window_size: int = 8):
     # Denoise
     output_padded = model(img_padded)
 
+    # Blend between input and denoised output to control visual strength.
+    # denoise_strength=1.0 => model output, <1.0 => softer, >1.0 => stronger.
+    if denoise_strength != 1.0:
+        output_padded = img_padded + (output_padded - img_padded) * denoise_strength
+
     # Remove padding to get back original size
     output = output_padded[:, :, :h, :w]
 
@@ -78,6 +83,7 @@ def main():
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--out", type=str, default="results/inference.png")
     parser.add_argument("--resize", type=int, default=None, help="Resize image to square size (optional)")
+    parser.add_argument("--strength", type=float, default=None, help="Denoise strength multiplier (default: config)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -115,7 +121,12 @@ def main():
     img = load_image(args.image, resize=args.resize)
 
     # Denoise
-    output = infer_image(model, img, device, window_size=8)
+    inf_cfg = cfg.get("inference", {})
+    strength = inf_cfg.get("denoise_strength", 1.0)
+    if args.strength is not None:
+        strength = float(args.strength)
+
+    output = infer_image(model, img, device, window_size=8, denoise_strength=strength)
 
 
     # Save result

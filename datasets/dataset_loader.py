@@ -5,6 +5,8 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+import random
 
 
 class BSD500Dataset(Dataset):
@@ -49,7 +51,8 @@ class BSD500Dataset(Dataset):
         noisy_subdir: str = "data/noisy",
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
-        patch_size: Optional[int] = None,   # 🔹 NEW: resize/crop to fixed size
+        patch_size: Optional[int] = None,
+        augment: bool = False,
     ):
         """
         Args:
@@ -73,6 +76,7 @@ class BSD500Dataset(Dataset):
         self.split = split
         self.noise_type = noise_type
         self.patch_size = patch_size
+        self.augment = augment
 
         # Build full paths
         self.clean_dir = os.path.join(root_dir, clean_subdir, split)
@@ -115,23 +119,12 @@ class BSD500Dataset(Dataset):
         self.transform = transform
         self.target_transform = target_transform
 
-        if self.transform is None or self.target_transform is None:
-            # 🔹 If patch_size is given, resize all images to (patch_size, patch_size)
-            if self.patch_size is not None:
-                default_tf = T.Compose(
-                    [
-                        T.Resize((self.patch_size, self.patch_size)),
-                        T.ToTensor(),
-                    ]
-                )
-            else:
-                # fallback: just ToTensor (no resizing)
-                default_tf = T.ToTensor()
-
-            if self.transform is None:
-                self.transform = default_tf
-            if self.target_transform is None:
-                self.target_transform = default_tf
+        # We use synchronized random crop in __getitem__ instead of
+        # putting crop into the transform pipeline, so default is just ToTensor
+        if self.transform is None:
+            self.transform = T.ToTensor()
+        if self.target_transform is None:
+            self.target_transform = T.ToTensor()
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -143,16 +136,91 @@ class BSD500Dataset(Dataset):
         noisy_img = Image.open(noisy_path).convert("RGB")
         clean_img = Image.open(clean_path).convert("RGB")
 
-        # Apply transforms
-        if self.transform:
-            noisy_tensor = self.transform(noisy_img)
-        else:
-            noisy_tensor = T.ToTensor()(noisy_img)
+        # Synchronized random crop (same region for both images)
+        if self.patch_size is not None:
+            w, h = noisy_img.size
+            crop_h = min(self.patch_size, h)
+            crop_w = min(self.patch_size, w)
+            i, j, th, tw = T.RandomCrop.get_params(noisy_img, (crop_h, crop_w))
+            noisy_img = TF.crop(noisy_img, i, j, th, tw)
+            clean_img = TF.crop(clean_img, i, j, th, tw)
 
-        if self.target_transform:
-            clean_tensor = self.target_transform(clean_img)
-        else:
-            clean_tensor = T.ToTensor()(clean_img)
+        # Synchronized data augmentation
+        if self.augment:
+            from datasets.data_augmentation import augment_pair
+            noisy_img, clean_img = augment_pair(noisy_img, clean_img)
+
+        # Apply transforms (ToTensor)
+        noisy_tensor = self.transform(noisy_img)
+        clean_tensor = self.target_transform(clean_img)
+
+        return noisy_tensor, clean_tensor
+
+
+class OnTheFlyNoiseDataset(Dataset):
+    """
+    Dataset that loads clean images and adds noise on-the-fly.
+    This provides infinite noise variety across epochs vs. fixed pre-saved noisy images.
+    """
+
+    def __init__(
+        self,
+        root_dir: str = ".",
+        split: str = "train",
+        clean_subdir: str = "data/raw",
+        patch_size: Optional[int] = None,
+        sigma_range: Tuple[float, float] = (5.0, 50.0),
+        augment: bool = False,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.sigma_range = sigma_range
+        self.augment = augment
+
+        self.clean_dir = os.path.join(root_dir, clean_subdir, split)
+        if not os.path.isdir(self.clean_dir):
+            raise FileNotFoundError(f"Clean directory not found: {self.clean_dir}")
+
+        self.clean_files = sorted(
+            [
+                os.path.join(self.clean_dir, f)
+                for f in os.listdir(self.clean_dir)
+                if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"))
+            ]
+        )
+        if len(self.clean_files) == 0:
+            raise RuntimeError(f"No images found in {self.clean_dir}")
+
+    def __len__(self) -> int:
+        return len(self.clean_files)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        clean_img = Image.open(self.clean_files[idx]).convert("RGB")
+
+        # Synchronized random crop
+        if self.patch_size is not None:
+            w, h = clean_img.size
+            crop_h = min(self.patch_size, h)
+            crop_w = min(self.patch_size, w)
+            i, j, th, tw = T.RandomCrop.get_params(clean_img, (crop_h, crop_w))
+            clean_img = TF.crop(clean_img, i, j, th, tw)
+
+        # Data augmentation (flips + rotations)
+        if self.augment:
+            if random.random() > 0.5:
+                clean_img = TF.hflip(clean_img)
+            if random.random() > 0.5:
+                clean_img = TF.vflip(clean_img)
+            rot = random.choice([0, 90, 180, 270])
+            if rot != 0:
+                clean_img = TF.rotate(clean_img, rot)
+
+        clean_tensor = TF.to_tensor(clean_img)
+
+        # Add Gaussian noise on-the-fly with random sigma
+        sigma = random.uniform(self.sigma_range[0], self.sigma_range[1])
+        noise = torch.randn_like(clean_tensor) * (sigma / 255.0)
+        noisy_tensor = (clean_tensor + noise).clamp(0.0, 1.0)
 
         return noisy_tensor, clean_tensor
 
@@ -164,26 +232,34 @@ def get_bsd500_dataloader(
     batch_size: int = 16,
     shuffle: bool = True,
     num_workers: int = 4,
-    patch_size: Optional[int] = None,  # 🔹 NEW: pass patch_size to dataset
+    patch_size: Optional[int] = None,
+    on_the_fly: bool = False,
+    sigma_range: Tuple[float, float] = (5.0, 50.0),
+    augment: bool = False,
 ) -> DataLoader:
     """
     Convenience function to get a DataLoader for BSD500Dataset.
 
-    Example:
-        train_loader = get_bsd500_dataloader(
-            root_dir=".",
-            split="train",
-            noise_type="gaussian",
-            batch_size=16,
-            patch_size=128,
-        )
+    Args:
+        on_the_fly: If True, uses OnTheFlyNoiseDataset (generates noise dynamically).
+        sigma_range: Range of sigma values for on-the-fly noise generation.
+        augment: If True, apply random flips and rotations (on-the-fly mode only).
     """
-    dataset = BSD500Dataset(
-        root_dir=root_dir,
-        split=split,
-        noise_type=noise_type,
-        patch_size=patch_size,
-    )
+    if on_the_fly:
+        dataset = OnTheFlyNoiseDataset(
+            root_dir=root_dir,
+            split=split,
+            patch_size=patch_size,
+            sigma_range=sigma_range,
+            augment=augment,
+        )
+    else:
+        dataset = BSD500Dataset(
+            root_dir=root_dir,
+            split=split,
+            noise_type=noise_type,
+            patch_size=patch_size,
+        )
 
     loader = DataLoader(
         dataset,
